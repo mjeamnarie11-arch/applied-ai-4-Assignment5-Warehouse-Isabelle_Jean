@@ -17,6 +17,8 @@ Students should replace the naive methods with proper optimization algorithms.
 import numpy as np
 from typing import Dict, Optional
 from .standardized_agents import BaselineAgent
+from environment.employee import EmployeeState
+from environment.warehouse_grid import CellType
 
 class SkeletonOptimizationAgent(BaselineAgent):
     """
@@ -93,47 +95,157 @@ class SkeletonOptimizationAgent(BaselineAgent):
         # TODO WEEK 2 STEP 1: Students should implement intelligent staffing logic
         # Current approach: Make random decisions based on "vibes"
         
-        current_profit = financial_state[0]
-        num_employees = np.sum(employee_info[:, 0] > 0)  # Count active employees
-        
-        # Terrible logic: Random decisions with slight bias
-        # BUT: Hire managers more frequently so layout optimization can work
-        has_manager = np.any(employee_info[:, 5] == 1)  # Check if we have a manager
-        
-        if np.random.random() < 0.3:  # 30% chance to hire
-            if num_employees < 20:  # Don't go completely overboard
+        num_employees = len(self.env.employees)
+        has_manager = any(
+            employee.is_manager for employee in self.env.employees
+        )
+        can_hire = num_employees < self.env.max_employees
+
+        if np.random.random() < 0.3:
+            if can_hire:
                 return 1  # Hire worker
-        elif np.random.random() < 0.1:  # 10% chance to fire
-            if num_employees > 1:  # Don't fire everyone
-                return 2  # Fire worker
-        elif np.random.random() < 0.2:  # 20% chance to hire manager (increased from 5%)
-            if not has_manager or num_employees > 10:  # Hire manager if we don't have one, or if we have lots of workers
-                return 3  # Hire manager
-        
-        return 0  # No action
+
+        elif np.random.random() < 0.1:
+            if num_employees > 1:
+                return 2  # Fire employee
+
+        elif np.random.random() < 0.2:
+            if can_hire and not has_manager:
+                return 3  # Hire manager only when none exists
+
+        return 0  # No staffing change
     
     def _get_naive_layout_action(self, current_timestep) -> list:
         """
-        WEEK 1 STEP 1: Layout optimization - students should improve this!
-        
-        Current problems:
-        - Random swaps with no strategic purpose
-        - Ignores item co-occurrence patterns
-        - No consideration of delivery distances
-        - Wastes manager time on pointless moves
+        Retain the template's random staffing decisions while correcting
+        employee counting, manager detection, and hiring limits.
         """
         
         # TODO WEEK 1 STEP 1: Students should implement intelligent layout optimization
         # Current approach: Occasionally make random swaps
         
-        if current_timestep % 100 == 0 and np.random.random() < 0.2:  # Random timing
-            # Pick two random positions to swap
-            grid_size = self.env.grid_width * self.env.grid_height
-            pos1 = np.random.randint(0, grid_size)
-            pos2 = np.random.randint(0, grid_size)
-            return [pos1, pos2]
-        
-        return [0, 0]  # No swap
+        if current_timestep == 0 or current_timestep % 100 != 0:
+            return [0, 0]
+
+        grid = self.env.warehouse_grid
+        frequencies = grid.item_access_frequency
+
+        print(
+            f"[Layout step {current_timestep}] "
+            f"Recorded accesses: {frequencies.sum():.0f}, "
+            f"Employees: {len(self.env.employees)}"
+        )
+
+        # The environment uses the first manager for relocation requests.
+        manager = next(
+            (employee for employee in self.env.employees
+             if employee.is_manager),
+            None
+        )
+
+        if manager is None:
+            print("  Skipped: no manager available.")
+            return [0, 0]
+
+        if manager.state != EmployeeState.IDLE:
+            print(f"  Skipped: manager is busy ({manager.state.name}).")
+            return [0, 0]
+
+        if not np.any(frequencies > 0):
+            print("  Skipped: no product retrievals recorded yet.")
+            return [0, 0]
+
+        # Only accessible permanent storage cells are valid swap locations.
+        positions = [
+            (x, y)
+            for y in range(grid.height)
+            for x in range(grid.width)
+            if grid.cell_types[y, x] == CellType.STORAGE.value
+            and grid.can_access_storage(x, y)
+        ]
+
+        distances = {
+            position: self._distance_to_delivery(position)
+            for position in positions
+        }
+
+        # Estimate demand per copy of each product.
+        copy_counts = np.bincount(
+            grid.item_grid[grid.item_grid >= 0],
+            minlength=len(frequencies)
+        )
+
+        best_score = 0.0
+        best_swap = [0, 0]
+
+        for source in positions:
+            source_item = grid.get_item_at_position(*source)
+            if source_item is None:
+                continue
+
+            source_frequency = (
+                frequencies[source_item] / max(1, copy_counts[source_item])
+            )
+            if source_frequency <= 0:
+                continue
+
+            for target in positions:
+                distance_saved = distances[source] - distances[target]
+
+                # Require at least two steps of delivery-distance improvement.
+                if distance_saved < 2:
+                    continue
+
+                target_item = grid.get_item_at_position(*target)
+                if target_item == source_item:
+                    continue
+
+                target_frequency = 0.0
+                if target_item is not None:
+                    target_frequency = (
+                        frequencies[target_item]
+                        / max(1, copy_counts[target_item])
+                    )
+
+                # Account for moving the other product farther from delivery.
+                net_benefit = (
+                    source_frequency - target_frequency
+                ) * distance_saved
+
+                if net_benefit <= 0:
+                    continue
+
+                # Favor beneficial swaps with shorter manager travel.
+                relocation_distance = (
+                    grid.manhattan_distance(manager.position, source)
+                    + grid.manhattan_distance(source, target)
+                )
+                score = net_benefit / (1 + relocation_distance)
+
+                if score > best_score:
+                    best_score = score
+                    best_swap = [
+                        source[1] * grid.width + source[0],
+                        target[1] * grid.width + target[0]
+                    ]
+
+        print(
+            f"  Selected swap: {best_swap}, "
+            f"Estimated score: {best_score:.2f}"
+        )
+
+        if best_swap == [0, 0]:
+            print("  No beneficial swap found.")
+
+        return best_swap
+
+    def _distance_to_delivery(self, position) -> int:
+        """Return Manhattan distance to the nearest truck bay."""
+        grid = self.env.warehouse_grid
+        return min(
+            grid.manhattan_distance(position, bay)
+            for bay in grid.truck_bay_positions
+        )
     
     def _get_naive_order_assignments(self, queue_info, employee_info) -> list:
         """
