@@ -84,36 +84,60 @@ class SkeletonOptimizationAgent(BaselineAgent):
     
     def _get_naive_staffing_action(self, financial_state, employee_info) -> int:
         """
-        WEEK 2 STEP 1: Staffing decisions - students should improve this!
-        
-        Current problems:
-        - Ignores queue length and workload
-        - Random decisions regardless of profit
-        - No consideration of employee efficiency
+        Keep one manager available for layout work.
+        Retain random worker staffing within the employee limit.
         """
         
         # TODO WEEK 2 STEP 1: Students should implement intelligent staffing logic
         # Current approach: Make random decisions based on "vibes"
         
-        num_employees = len(self.env.employees)
-        has_manager = any(
-            employee.is_manager for employee in self.env.employees
-        )
+        employees = self.env.employees
+        num_employees = len(employees)
+        has_manager = any(employee.is_manager for employee in employees)
         can_hire = num_employees < self.env.max_employees
 
+        # Identify who the environment would remove if we request firing.
+        idle_employees = [
+            employee for employee in employees
+            if employee.state == EmployeeState.IDLE
+        ]
+        fire_candidate = (
+            idle_employees[0]
+            if idle_employees
+            else (employees[-1] if employees else None)
+        )
+
+        # Prioritize obtaining a manager so layout changes can be performed.
+        if not has_manager:
+            if can_hire:
+                return 3  # Hire one manager
+
+            # Make room without interrupting an active worker's order.
+            if (
+                fire_candidate is not None
+                and not fire_candidate.is_manager
+                and fire_candidate.state == EmployeeState.IDLE
+            ):
+                return 2
+
+            return 0
+
+        # Retain the template's random worker hiring.
         if np.random.random() < 0.3:
             if can_hire:
-                return 1  # Hire worker
+                return 1
 
         elif np.random.random() < 0.1:
-            if num_employees > 1:
-                return 2  # Fire employee
+            # Never fire the manager or interrupt an active employee.
+            if (
+                num_employees > 1
+                and fire_candidate is not None
+                and not fire_candidate.is_manager
+                and fire_candidate.state == EmployeeState.IDLE
+            ):
+                return 2
 
-        elif np.random.random() < 0.2:
-            if can_hire and not has_manager:
-                return 3  # Hire manager only when none exists
-
-        return 0  # No staffing change
+        return 0 
     
     def _get_naive_layout_action(self, current_timestep) -> list:
         """
@@ -130,10 +154,17 @@ class SkeletonOptimizationAgent(BaselineAgent):
         grid = self.env.warehouse_grid
         frequencies = grid.item_access_frequency
 
+        completed_moves = sum(
+            relocation["status"] == "completed"
+            for relocation in self.env.relocations_history
+        )
+
         print(
             f"[Layout step {current_timestep}] "
             f"Recorded accesses: {frequencies.sum():.0f}, "
-            f"Employees: {len(self.env.employees)}"
+            f"Employees: {len(self.env.employees)}, "
+            f"Relocations started: {len(self.env.relocations_history)}, "
+            f"Completed: {completed_moves}"
         )
 
         # The environment uses the first manager for relocation requests.
